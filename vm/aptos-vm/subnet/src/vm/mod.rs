@@ -1,5 +1,6 @@
 use std::{collections::HashMap, fs, io::{self, Error, ErrorKind}, sync::Arc};
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 use avalanche_types::{
     choices, ids,
     subnet::{self, rpc::snow},
@@ -13,7 +14,8 @@ use avalanche_types::subnet::rpc::snow::engine::common::http_handler::{HttpHandl
 use avalanche_types::subnet::rpc::snow::engine::common::message::Message::PendingTxs;
 use avalanche_types::subnet::rpc::snow::engine::common::vm::{CommonVm, Connector};
 use avalanche_types::subnet::rpc::snow::validators::client::ValidatorStateClient;
-use avalanche_types::subnet::rpc::snowman::block::{ChainVm, Getter, Parser};
+use avalanche_types::subnet::rpc::snowman::block::{BatchedChainVm, ChainVm, Getter, Parser};
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::{channel::mpsc as futures_mpsc, StreamExt};
 use hex;
@@ -133,6 +135,8 @@ pub struct Vm {
 
     pub executor: Option<Arc<RwLock<BlockExecutor<AptosVM, Transaction>>>>,
 
+    pub is_buiding_block: Arc<RwLock<bool>>,
+
 }
 
 
@@ -156,6 +160,7 @@ impl Vm {
             signer: None,
             executor: None,
             db: None,
+            is_buiding_block: Arc::new(RwLock::new(false)),
         }
     }
 
@@ -893,14 +898,83 @@ impl Vm {
                           signed_transaction.clone().sequence_number(),
                           TimelineState::NonQualified);
     }
+    async fn get_pending_tx(&self, count: u64) -> Vec<SignedTransaction> {
+        let core_pool = self.core_mempool.as_ref().unwrap().read().await;
+        core_pool.get_batch(count,
+                            1024 * 5 * 1000,
+                            true,
+                            true, vec![])
+    }
+
+    /// The logic of this function is to periodically check whether there is a block currently
+    /// being constructed and whether there are pending transactions. If there is no block being
+    /// constructed and the waiting time for unprocessed transactions has timed out, it allows
+    /// the construction of a new block. If there is a block currently being constructed or the
+    /// waiting time for unprocessed transactions has not timed out, it continues to wait.
+    async fn check_pending_tx(&self) {
+        // Clone the reference to `self` and create an Arc pointer to allow for multiple owners.
+        let shared_self = Arc::new(self.clone());
+        // Define the duration after which we will consider a check to have timed-out.
+        let check_timeout_duration = Duration::from_secs(2);
+        // Define the duration for which we will wait between each check.
+        let check_duration = Duration::from_millis(500);
+        // Spawn a new task to handle the checking logic asynchronously.
+        tokio::task::spawn(async move {
+            // Initialize a variable to keep track of the last time we checked for unprocessed transactions.
+            let mut last_check_time = Instant::now();
+            // Enter an infinite loop.
+            loop {
+                // Wait for the specified time interval before continuing.
+                _ = tokio::time::sleep(check_duration).await;
+                // Acquire a read lock on the shared `is_building_block` data to check if there are any blocks being built.
+                let is_build = shared_self.is_buiding_block.read().await;
+                if !*is_build { // If there is no building block...
+                    // Check if the time elapsed since the last check is greater than the timeout duration.
+                    if last_check_time.elapsed() > check_timeout_duration {
+                        // If so, release the read lock and acquire a write lock to modify the shared data.
+                        drop(is_build);
+                        let mut is_build = shared_self.is_buiding_block.write().await;
+                        // Set the `is_building_block` to `false` to indicate that a new block can now be built.
+                        *is_build = false;
+                    } else { // If the timeout duration has not yet been reached...
+                        // Call the `get_pending_tx` function to acquire the list of unprocessed transactions.
+                        let tx_arr = shared_self.get_pending_tx(1).await;
+                        if !tx_arr.is_empty() { // If there are any unprocessed transactions...
+                            // Notify the main thread that a block is ready to be built, and update the last check time.
+                            shared_self.notify_block_ready().await;
+                            last_check_time = Instant::now();
+                        }
+                    }
+                } else { // If there is a building block...
+                    // Update the last check time to prevent any timeouts during the block construction process.
+                    last_check_time = Instant::now();
+                }
+            }
+        });
+    }
+
 
     async fn notify_block_ready(&self) {
-        let to_engine = self.to_engine.as_ref().unwrap();
-        let to_engine = to_engine.read().await;
-        to_engine
-            .send(PendingTxs)
-            .await
-            .unwrap_or_else(|e| log::warn!("dropping message to consensus engine: {}", e));
+        {
+            let is_build = self.is_buiding_block.read().await;
+            if *is_build {
+                return;
+            }
+        }
+        if let Some(to_engine) = &self.to_engine {
+            let send_result = {
+                let to_engine = to_engine.read().await;
+                to_engine.send(PendingTxs).await
+            };
+            if send_result.is_ok() {
+                let mut is_build = self.is_buiding_block.write().await;
+                *is_build = true;
+            } else {
+                log::info!("send tx to_engine error ")
+            }
+        } else {
+            log::info!("send tx to_engine error ")
+        }
     }
 
     pub async fn simulate_transaction(&self, data: Vec<u8>) -> RpcRes {
@@ -1082,7 +1156,7 @@ impl Vm {
                 "block error,maybe not sync ",
             ));
         }
-        println!("------------inner_build_block-------{}----", block_id);
+        println!("------------inner_build_block {}----", block_id);
         let next_epoch = aptos_data.3;
         let ts = aptos_data.4;
         let output = executor
@@ -1118,6 +1192,8 @@ impl Vm {
                 _ => {}
             }
         }
+        let mut is_build = self.is_buiding_block.write().await;
+        *is_build = false;
         if is_miner {
             Ok(serde_json::to_vec(&li).unwrap())
         } else {
@@ -1166,6 +1242,7 @@ impl Vm {
         let service = get_raw_api_service(Arc::new(context));
         self.api_service = Some(service);
         self.core_mempool = Some(Arc::new(RwLock::new(CoreMempool::new(&node_config))));
+        self.check_pending_tx().await;
         tokio::task::spawn(async move {
             while let Some(request) = mempool_client_receiver.next().await {
                 match request {
@@ -1185,6 +1262,31 @@ impl Vm {
 }
 
 #[tonic::async_trait]
+impl BatchedChainVm for Vm {
+    type Block = Block;
+
+    async fn get_ancestors(
+        &self,
+        _block_id: ids::Id,
+        _max_block_num: i32,
+        _max_block_size: i32,
+        _max_block_retrival_time: Duration,
+    ) -> io::Result<Vec<Bytes>> {
+        Err(Error::new(
+            ErrorKind::Unsupported,
+            "get_ancestors not implemented",
+        ))
+    }
+
+    async fn batched_parse_block(&self, _blocks: &[Vec<u8>]) -> io::Result<Vec<Self::Block>> {
+        Err(Error::new(
+            ErrorKind::Unsupported,
+            "batched_parse_block not implemented",
+        ))
+    }
+}
+
+#[tonic::async_trait]
 impl ChainVm for Vm
 {
     type Block = Block;
@@ -1196,13 +1298,8 @@ impl ChainVm for Vm
         if let Some(state_b) = vm_state.state.as_ref() {
             let prnt_blk = state_b.get_block(&vm_state.preferred).await.unwrap();
             let unix_now = Utc::now().timestamp() as u64;
-            let core_pool = self.core_mempool.as_ref().unwrap().read().await;
-            let tx_arr = core_pool.get_batch(1000,
-                                             1024 * 1000,
-                                             true,
-                                             true, vec![]);
+            let tx_arr = self.get_pending_tx(10000).await;
             println!("----build_block pool tx count-------{}------", tx_arr.clone().len());
-            drop(core_pool);
             let executor = self.executor.as_ref().unwrap().read().await;
             let signer = self.signer.as_ref().unwrap();
             let db = self.db.as_ref().unwrap().read().await;
